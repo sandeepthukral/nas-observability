@@ -1,0 +1,4 @@
+# Nothing in this repo is generated or secret. Left here so an accidental
+# `docker compose` scratch file or an editor swap file does not get committed.
+*.swp
+.DS_Store

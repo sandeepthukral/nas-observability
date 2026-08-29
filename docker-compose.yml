@@ -1,0 +1,101 @@
+# NAS-wide container log aggregation.
+#
+# Two services and no application code: Loki stores logs, Alloy collects them. The
+# Grafana that reads them is NOT here -- it belongs to alphaess-collector, which owns
+# `alphaess-net`, InfluxDB, Grafana and their volumes (see that repo's DEPLOY.md,
+# "Sharing the stack with another project"). The Loki datasource, the Container Logs
+# dashboard and the error alert rule are provisioned from there, because Grafana
+# provisioning cannot be owned by two repos at once.
+#
+# WHAT ANOTHER PROJECT HAS TO DO TO BE LOGGED: nothing. Alloy asks the Docker daemon for
+# the log stream of every container the daemon can see, so a container is in scope purely
+# by running on this NAS -- not by joining alphaess-net, not by being a project Alloy has
+# heard of, not by having a Grafana of its own. See README.md, "Being logged".
+#
+#   sudo docker compose up -d
+#
+# sudo because docker on the Synology needs it.
+
+x-logging: &default-logging
+  # These two are as capable of unbounded log growth as anything else on the host, and
+  # Alloy reads its own container's output back into Loki. Cap and rotate, same as the
+  # alphaess-collector stack.
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-timezone: &default-timezone
+  # Container clock, for log timestamps only. Without it these two run UTC while the NAS,
+  # Grafana and Uptime Kuma show local time, so a log line and the dashboard row for the
+  # same failure land two hours apart in summer. Loki stores UTC regardless.
+  TZ: ${TZ:-Europe/Amsterdam}
+
+services:
+  loki:
+    image: grafana/loki:3.4.2
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      <<: *default-timezone
+    command: ["-config.file=/etc/loki/loki-config.yaml"]
+    # NO `ports:` BLOCK, DELIBERATELY. Loki has no authentication of its own -- publishing
+    # 3100 to the LAN would put an endpoint that can be both queried and WRITTEN by anyone
+    # on the network next to a Grafana that is deliberately password-gated. It is reachable
+    # as http://loki:3100 from alphaess-net, which is all Grafana and Alloy need.
+    volumes:
+      - ./loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      # path_prefix in the config points here; chunks, index, WAL and the compactor's
+      # working directory all live under it.
+      - nas-loki-data:/loki
+    networks:
+      - alphaess-net
+    healthcheck:
+      # Catches a crash-loop (a malformed config file is the likely one) in
+      # `docker compose ps`, instead of it showing up as an empty dashboard.
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3100/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  alloy:
+    image: grafana/alloy:v1.7.5
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      <<: *default-timezone
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    volumes:
+      - ./config.alloy:/etc/alloy/config.alloy:ro
+      # THE DOCKER SOCKET IS ROOT-EQUIVALENT ON THE HOST. Anything that can write to it can
+      # start a privileged container. Mounted `:ro` so this container can only enumerate
+      # containers and read their logs, and nothing else is added to this service for the
+      # same reason -- it exists to read logs and must stay boring.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Positions file: which line of each container's stream was last shipped. On a volume
+      # so a restart resumes instead of re-sending, or skipping, the current window.
+      - nas-alloy-data:/var/lib/alloy/data
+    # Required on Synology: the socket is owned by root:root and the image's default
+    # `alloy` user cannot read it. Without this Alloy starts cleanly and discovers zero
+    # containers -- a permission error in its own log and an empty dashboard.
+    user: root
+    depends_on:
+      loki:
+        condition: service_healthy
+    networks:
+      - alphaess-net
+
+networks:
+  # Owned by alphaess-collector, which pins the name and the 1400 MTU cap. Declared
+  # external here and defined nowhere in this file: a second definition would create a
+  # separate network with the same intent and no route to Grafana.
+  alphaess-net:
+    external: true
+
+volumes:
+  nas-loki-data:
+  nas-alloy-data:

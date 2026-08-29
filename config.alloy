@@ -1,0 +1,102 @@
+// Alloy: discover every container on this NAS, read its logs, ship them to Loki.
+//
+// Promtail, which this replaces, was deprecated in February 2025 and reached EOL in
+// March 2026. Alloy is its successor and this is the equivalent pipeline.
+
+logging {
+  level  = "warn"
+  format = "logfmt"
+}
+
+// EVERY container the Docker daemon can see, not a configured list. This is what makes
+// a new repo zero-effort: it does not have to join a network, be named here, or know
+// this stack exists. `refresh_interval` is also how quickly a container started after
+// Alloy appears -- 15s, so a `docker compose up` shows up in the dashboard while you are
+// still looking at it.
+discovery.docker "containers" {
+  host             = "unix:///var/run/docker.sock"
+  refresh_interval = "15s"
+}
+
+// THREE LABELS, ALL LOW-CARDINALITY, AND NO MORE.
+//
+// Each distinct combination of label values is a separate Loki stream with its own index
+// entry and its own chunks. These three are bounded by the number of containers on the
+// NAS -- a few dozen at worst. Adding image tag, container id, or anything derived from
+// the log line itself is how a small Loki falls over: the index outgrows the logs.
+discovery.relabel "containers" {
+  targets = discovery.docker.containers.targets
+
+  // Docker reports the name with a leading slash ("/collector"), which would show up in
+  // every dashboard label and every query.
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/?(.*)"
+    target_label  = "container"
+  }
+
+  // Compose sets these two on every container it creates, without being asked. `project`
+  // is what separates one repo's logs from another's in the dashboard, and a new repo
+  // gets it for free. A container started with plain `docker run` has neither and simply
+  // arrives with those labels empty -- still collected, still readable.
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    target_label  = "project"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+}
+
+// No refresh_interval here: the 15s above is the one that matters. discovery.docker
+// re-enumerates on that interval and this component follows its target list, so a newly
+// started container is picked up either way.
+loki.source.docker "containers" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.containers.output
+  forward_to = [loki.process.levels.receiver]
+}
+
+// Level extraction for the Python services in alphaess-collector, all of which format as
+// `%(asctime)s %(levelname)s %(name)s: %(message)s` -- date, time, LEVEL, logger. So the
+// level is the third whitespace-separated token, and the two \S+ ahead of it are the date
+// and the time.
+//
+// Loki's own `discover_log_levels` is a heuristic and usually gets this. "Usually" is not
+// good enough for the one panel whose entire job is to be complete: a warning it fails to
+// classify is a warning the error dashboard does not show, which is the failure this whole
+// stack exists to remove.
+//
+// A line that does not match -- Grafana's own logs, InfluxDB's, any third-party image --
+// falls through untouched and keeps whatever Loki's heuristic makes of it. This stage only
+// ever adds certainty; it cannot take a level away.
+loki.process "levels" {
+  stage.regex {
+    expression = "^\\S+ \\S+ (?P<level>DEBUG|INFO|WARNING|ERROR|CRITICAL)\\b"
+  }
+
+  // Structured metadata, not a label -- see the cardinality note above and the matching
+  // comment in loki-config.yaml.
+  //
+  // The value is left as Python spells it (WARNING, ERROR), while Loki's own heuristic
+  // emits lowercase (warn, error). Rather than normalise here -- which would mean a
+  // template stage whose function set differs between Alloy versions -- the dashboard
+  // matches case-insensitively and accepts both spellings. If you write a query by hand,
+  // use `detected_level =~ "(?i)(warn|warning|error|critical|fatal)"`, not `= "error"`.
+  stage.structured_metadata {
+    values = {
+      detected_level = "level",
+    }
+  }
+
+  forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+  endpoint {
+    // Service name on alphaess-net. Not the NAS's IP: that routes out over the LAN and
+    // back for traffic between two containers on the same bridge.
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
