@@ -72,6 +72,35 @@ be owned by two repos at once:
 Practical consequence: changing a label in `config.alloy` may require a matching change to
 the dashboard queries in the other repo, and nothing checks that for you.
 
+## Changing a config file
+
+`loki-config.yaml` and `config.alloy` are bind mounts, and **`docker compose up -d` will
+not pick up an edit to either.** Compose diffs the mount *spec*, not the file behind it,
+so an identical spec means no recreate and the container keeps running with the old
+config already read into memory. Nothing reports this — the file on disk is right, the
+running service disagrees, and `up -d` prints nothing to say so.
+
+```
+cd /volume1/docker/nas-observability
+git pull
+sudo docker compose up -d --force-recreate loki    # or alloy
+```
+
+Then confirm against the running process rather than the file:
+
+```
+sudo docker compose exec loki wget -qO- http://localhost:3100/config | grep -A1 reject_old
+```
+
+Expect `30d` for the current retention setting. Loki normalises durations, so `720h` in
+the file reads back as `30d` — that is the same value, not a setting that failed to
+apply.
+
+A restart also puts a short burst into the error dashboard: Alloy logs `No such
+container` for the container that just went away, `empty ring` while Loki forms its ring,
+and `error sending batch, will retry` for anything buffered meanwhile. All three clear
+themselves within a few seconds.
+
 ## Querying Loki by hand
 
 Alloy's image is distroless and has no shell tools, so `exec` into **loki** instead --
