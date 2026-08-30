@@ -44,9 +44,16 @@ silent:
   ```
   `json-file` or `local` are collected. `none`, `syslog` and `gelf` are not.
 
-Logs are also not backfilled: Alloy starts from the current position, so lines written
-before it first ran, or while it was down, stay on disk and are reachable only through
-`docker logs` until rotation discards them.
+**The first start replays history, and it can be a lot of it.** On an empty positions
+file Alloy reads each container's whole retained `json-file` log, not just new lines --
+so a container with no rotation cap hands over months at once. Loki refuses anything
+older than `reject_old_samples_max_age` and Alloy logs a `400` per rejected batch, which
+looks alarming and is not: the valid entries in each batch are still stored, and it
+drains in about a minute. After that the positions file makes restarts resume cleanly.
+
+What *is* lost is anything older than the 30-day retention window, and anything written
+while Alloy is down and rotated away before it comes back. `docker logs` remains the
+only route to those.
 
 ## Where Grafana is
 
@@ -64,6 +71,20 @@ be owned by two repos at once:
 
 Practical consequence: changing a label in `config.alloy` may require a matching change to
 the dashboard queries in the other repo, and nothing checks that for you.
+
+## Querying Loki by hand
+
+Alloy's image is distroless and has no shell tools, so `exec` into **loki** instead --
+its own image ships `wget`, which is also what its healthcheck uses:
+
+```
+cd /volume1/docker/nas-observability
+sudo docker compose exec loki wget -qO- 'http://localhost:3100/loki/api/v1/label/project/values'
+```
+
+That one is the health check worth knowing: it lists every compose project currently
+reaching Loki. A project missing from it is one whose log driver needs checking, per
+"Being logged" above.
 
 ## Files
 

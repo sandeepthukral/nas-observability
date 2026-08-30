@@ -62,11 +62,21 @@ limits_config:
   # Powers the volume/"log volume" panel in Grafana Explore.
   volume_enabled: true
 
-  # A container that has been down a while replays its old lines on restart; accepting
-  # them would file today's ingest under last week's index. A week of slack is generous
-  # for a NAS that is rarely off longer than a reboot.
+  # MATCHED TO retention_period ABOVE, NOT SHORTER. Rejecting a line that is inside the
+  # window this Loki is meant to keep is incoherent: it is old enough to be interesting
+  # and young enough not to be deleted, and refusing it loses the only copy.
+  #
+  # 168h here was the original guess and it was wrong in a way only the first start
+  # revealed. Alloy reads each container's ENTIRE retained json-file history on a fresh
+  # positions file, and the containers outside these two repos have no rotation cap -- so
+  # the first run replayed months of sonarr, radarr and teslamate history and every batch
+  # came back 400. Harmless (Loki accepts the valid entries in a rejected batch) and it
+  # drained in about a minute, but it buried the real startup log while it lasted.
+  #
+  # Kept rather than removed, because the check itself is worth having: a container that
+  # has been off for a season should not file its old lines as though they were today's.
   reject_old_samples: true
-  reject_old_samples_max_age: 168h
+  reject_old_samples_max_age: 720h
 
 compactor:
   working_directory: /loki/compactor
